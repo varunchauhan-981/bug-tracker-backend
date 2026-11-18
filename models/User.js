@@ -21,10 +21,10 @@ const userSchema = new mongoose.Schema(
       minlength: 6,
     },
     role: {
-      type: String,
-      enum: ['developer', 'manager', 'admin'],
-      default: 'developer',
-    },
+    type: String,
+    enum: ['Admin', 'Project Manager', 'Developer'],
+    default: 'Developer'
+}
   },
   {
     // Automatically manage createdAt and updatedAt timestamps
