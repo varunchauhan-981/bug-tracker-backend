@@ -1,92 +1,195 @@
-const User = require('../models/User');
-const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+const User = require('../models/User');
 
-// Helper function to generate signed JWT token
 const generateToken = (id) => {
   return jwt.sign({ id }, process.env.JWT_SECRET, {
-    expiresIn: '7d',
+    expiresIn: '7d'
   });
 };
 
-// @desc    Register a new user
-// @route   POST /api/auth/register
-// @access  Public
-const registerUser = async (req, res) => {
+// Register new user or claim an invited account
+exports.registerUser = async (req, res) => {
   try {
     const { name, email, password, role } = req.body;
+    const normalizedEmail = email?.trim().toLowerCase();
 
-    if (!name || !email || !password) {
-      return res.status(400).json({ message: 'Please fill in all required fields' });
+    if (!name?.trim() || !normalizedEmail || !password) {
+      return res.status(400).json({ message: 'Name, email, and password are required' });
     }
 
-    // Check if user already exists in database
-    const userExists = await User.findOne({ email });
-    if (userExists) {
-      return res.status(400).json({ message: 'User already exists with this email' });
+    const existingUser = await User.findOne({ email: normalizedEmail }).select('+password');
+
+    // If user was pre-created via invite and has no real password yet, activate account
+    if (existingUser && existingUser.isInvited) {
+      existingUser.name = name.trim();
+      existingUser.password = password;
+      if (role) existingUser.role = role;
+      existingUser.isInvited = false;
+      await existingUser.save();
+
+      return res.status(201).json({
+        _id: existingUser._id,
+        name: existingUser.name,
+        email: existingUser.email,
+        role: existingUser.role,
+        token: generateToken(existingUser._id)
+      });
     }
 
-    // Hash user password before storing in database
-    const salt = await bcrypt.genSalt(10);
-    const hashedPassword = await bcrypt.hash(password, salt);
+    if (existingUser) {
+      return res.status(400).json({ message: 'An account with this email already exists' });
+    }
 
-    // Create new user record
     const user = await User.create({
-      name,
-      email,
-      password: hashedPassword,
-      role: role || 'developer',
+      name: name.trim(),
+      email: normalizedEmail,
+      password,
+      role: role || 'Developer'
     });
 
-    res.status(201).json({
-      _id: user.id,
+    return res.status(201).json({
+      _id: user._id,
       name: user.name,
       email: user.email,
       role: user.role,
-      token: generateToken(user._id),
+      token: generateToken(user._id)
     });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    return res.status(500).json({ message: error.message || 'Registration failed' });
   }
 };
 
-// @desc    Authenticate user and return token
-// @route   POST /api/auth/login
-// @access  Public
-const loginUser = async (req, res) => {
+// Authenticate user and return token
+exports.loginUser = async (req, res) => {
   try {
     const { email, password } = req.body;
+    const normalizedEmail = email?.trim().toLowerCase();
 
-    // Find user by email
-    const user = await User.findOne({ email });
-
-    // Validate password against stored hash
-    if (user && (await bcrypt.compare(password, user.password))) {
-      res.status(200).json({
-        _id: user.id,
-        name: user.name,
-        email: user.email,
-        role: user.role,
-        token: generateToken(user._id),
-      });
-    } else {
-      res.status(401).json({ message: 'Invalid email or password' });
+    const user = await User.findOne({ email: normalizedEmail }).select('+password');
+    if (!user || user.isInvited) {
+      return res.status(401).json({ message: 'Invalid email or password' });
     }
+
+    const isMatch = await user.matchPassword(password);
+    if (!isMatch) {
+      return res.status(401).json({ message: 'Invalid email or password' });
+    }
+
+    return res.json({
+      _id: user._id,
+      name: user.name,
+      email: user.email,
+      role: user.role,
+      token: generateToken(user._id)
+    });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    return res.status(500).json({ message: error.message || 'Login failed' });
   }
 };
 
-// @desc    Get current logged-in user profile and list of users for ticket assignment
-// @route   GET /api/auth/users
-// @access  Private
-const getUsers = async (req, res) => {
+// List workspace users for assignment and member selection
+exports.getUsers = async (req, res) => {
   try {
-    const users = await User.find().select('-password');
-    res.status(200).json(users);
+    const users = await User.find({}).select('_id name email role isInvited createdAt');
+    return res.json(users);
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    return res.status(500).json({ message: 'Failed to load workspace users' });
   }
 };
 
-module.exports = { registerUser, loginUser, getUsers };
+// Update logged-in user's name
+exports.updateProfile = async (req, res) => {
+  try {
+    const { name } = req.body;
+    if (!name || !/^[a-zA-Z\s]{2,50}$/.test(name.trim())) {
+      return res.status(400).json({ message: 'Please provide a valid name' });
+    }
+
+    const user = await User.findById(req.user._id);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    user.name = name.trim();
+    await user.save();
+
+    return res.json({
+      _id: user._id,
+      name: user.name,
+      email: user.email,
+      role: user.role
+    });
+  } catch (error) {
+    return res.status(500).json({ message: 'Failed to update profile' });
+  }
+};
+
+// Update logged-in user's password after verifying current password
+exports.updatePassword = async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+    if (!currentPassword || !newPassword || newPassword.length < 6) {
+      return res.status(400).json({ message: 'Valid current and new passwords (min 6 chars) are required' });
+    }
+
+    const user = await User.findById(req.user._id).select('+password');
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    const isMatch = await user.matchPassword(currentPassword);
+    if (!isMatch) {
+      return res.status(401).json({ message: 'Current password is incorrect' });
+    }
+
+    user.password = newPassword;
+    await user.save();
+
+    return res.json({ message: 'Password updated successfully' });
+  } catch (error) {
+    return res.status(500).json({ message: 'Failed to update password' });
+  }
+};
+
+// Invite a team member to the workspace
+exports.inviteMember = async (req, res) => {
+  try {
+    if (!['Admin', 'Project Manager'].includes(req.user.role)) {
+      return res.status(403).json({ message: 'Not authorized to invite members' });
+    }
+
+    const { email, role } = req.body;
+    const normalizedEmail = email?.trim().toLowerCase();
+
+    if (!normalizedEmail || !/^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(normalizedEmail)) {
+      return res.status(400).json({ message: 'Please enter a valid email address' });
+    }
+
+    const existing = await User.findOne({ email: normalizedEmail });
+    if (existing) {
+      return res.status(400).json({ message: 'User with this email is already in the workspace' });
+    }
+
+    const tempPassword = crypto.randomBytes(12).toString('hex');
+    const invitedUser = await User.create({
+      name: normalizedEmail.split('@')[0],
+      email: normalizedEmail,
+      password: tempPassword,
+      role: role || 'Developer',
+      isInvited: true
+    });
+
+    return res.status(201).json({
+      message: `Invitation recorded for ${invitedUser.email}. They can sign up with this email to activate their account.`,
+      user: {
+        _id: invitedUser._id,
+        email: invitedUser.email,
+        role: invitedUser.role,
+        isInvited: invitedUser.isInvited
+      }
+    });
+  } catch (error) {
+    return res.status(500).json({ message: 'Failed to invite member' });
+  }
+};

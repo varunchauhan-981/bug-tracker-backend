@@ -4,14 +4,12 @@ const {
   createProject,
   getProjects,
   getProjectById,
-  addProjectMember,
-  deleteProject,
+  addProjectMember
 } = require('../controllers/projectController');
 const { protect } = require('../middleware/authMiddleware');
 
-// Protect all project routes with JWT authentication middleware
 router.route('/').post(protect, createProject).get(protect, getProjects);
-router.route('/:id').get(protect, getProjectById).delete(protect, deleteProject);
-router.route('/:id/members').put(protect, addProjectMember);
+router.get('/:id', protect, getProjectById);
+router.post('/:id/members', protect, addProjectMember);
 
 module.exports = router;

@@ -1,122 +1,94 @@
 const Project = require('../models/Project');
-const Ticket = require('../models/Ticket');
 
-// @desc    Create a new project
-// @route   POST /api/projects
-// @access  Private
-const createProject = async (req, res) => {
+// Create project and include creator + selected members
+exports.createProject = async (req, res) => {
   try {
-    const { name, description, members } = req.body;
-
-    // Ensure creator is automatically included in project members list
-    const memberList = members && members.length > 0 ? members : [];
-    if (!memberList.includes(req.user._id.toString())) {
-      memberList.push(req.user._id);
+    if (!['Admin', 'Project Manager'].includes(req.user.role)) {
+      return res.status(403).json({ message: 'Only Admin or Project Manager can create projects' });
     }
 
+    const { name, description, members = [] } = req.body;
+    const uniqueMembers = Array.from(
+      new Set([req.user._id.toString(), ...members.map((id) => id.toString())])
+    );
+
     const project = await Project.create({
-      name,
-      description,
+      name: name.trim(),
+      description: description.trim(),
       createdBy: req.user._id,
-      members: memberList,
+      members: uniqueMembers
     });
 
-    const populatedProject = await Project.findById(project._id)
-      .populate('createdBy', 'name email role')
-      .populate('members', 'name email role');
-
-    res.status(201).json(populatedProject);
+    const populated = await project.populate('members', 'name email role');
+    return res.status(201).json(populated);
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    return res.status(500).json({ message: error.message || 'Failed to create project' });
   }
 };
 
-// @desc    Get all projects
-// @route   GET /api/projects
-// @access  Private
-const getProjects = async (req, res) => {
+// Get projects based on role: Admin sees all; others see projects where they are creator or member
+exports.getProjects = async (req, res) => {
   try {
-    const projects = await Project.find()
-      .populate('createdBy', 'name email role')
+    const query =
+      req.user.role === 'Admin'
+        ? {}
+        : {
+            $or: [{ createdBy: req.user._id }, { members: req.user._id }]
+          };
+
+    const projects = await Project.find(query)
       .populate('members', 'name email role')
       .sort({ createdAt: -1 });
 
-    res.status(200).json(projects);
+    return res.json(projects);
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    return res.status(500).json({ message: 'Failed to fetch projects' });
   }
 };
 
-// @desc    Get single project by ID
-// @route   GET /api/projects/:id
-// @access  Private
-const getProjectById = async (req, res) => {
+// Get single project by ID
+exports.getProjectById = async (req, res) => {
   try {
-    const project = await Project.findById(req.params.id)
-      .populate('createdBy', 'name email role')
-      .populate('members', 'name email role');
-
+    const project = await Project.findById(req.params.id).populate('members', 'name email role');
     if (!project) {
       return res.status(404).json({ message: 'Project not found' });
     }
 
-    res.status(200).json(project);
+    const isMember = project.members.some((m) => m._id.toString() === req.user._id.toString());
+    const isCreator = project.createdBy.toString() === req.user._id.toString();
+
+    if (req.user.role !== 'Admin' && !isMember && !isCreator) {
+      return res.status(403).json({ message: 'Access denied to this project' });
+    }
+
+    return res.json(project);
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    return res.status(500).json({ message: 'Failed to load project' });
   }
 };
 
-// @desc    Add member to project
-// @route   PUT /api/projects/:id/members
-// @access  Private
-const addProjectMember = async (req, res) => {
+// Add member to existing project
+exports.addProjectMember = async (req, res) => {
   try {
+    if (!['Admin', 'Project Manager'].includes(req.user.role)) {
+      return res.status(403).json({ message: 'Not authorized to add project members' });
+    }
+
     const { userId } = req.body;
     const project = await Project.findById(req.params.id);
-
     if (!project) {
       return res.status(404).json({ message: 'Project not found' });
     }
 
-    if (!project.members.includes(userId)) {
+    const alreadyMember = project.members.some((id) => id.toString() === userId.toString());
+    if (!alreadyMember) {
       project.members.push(userId);
       await project.save();
     }
 
-    const updatedProject = await Project.findById(req.params.id)
-      .populate('createdBy', 'name email role')
-      .populate('members', 'name email role');
-
-    res.status(200).json(updatedProject);
+    const updated = await project.populate('members', 'name email role');
+    return res.json(updated);
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    return res.status(500).json({ message: 'Failed to add member to project' });
   }
-};
-
-// @desc    Delete a project and all its associated tickets
-// @route   DELETE /api/projects/:id
-// @access  Private
-const deleteProject = async (req, res) => {
-  try {
-    const project = await Project.findById(req.params.id);
-
-    if (!project) {
-      return res.status(404).json({ message: 'Project not found' });
-    }
-
-    await Ticket.deleteMany({ project: req.params.id });
-    await project.deleteOne();
-
-    res.status(200).json({ message: 'Project and related tickets removed' });
-  } catch (error) {
-    res.status(500).json({ message: error.message });
-  }
-};
-
-module.exports = {
-  createProject,
-  getProjects,
-  getProjectById,
-  addProjectMember,
-  deleteProject,
 };
